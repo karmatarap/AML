@@ -1,0 +1,544 @@
+---
+---
+title: "Homework 3"
+output: html_document
+---
+```{r}
+
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(dummies)
+library(boot)
+library(pROC)
+library(randomForest)
+library(tidyr)
+library(caret)
+library(e1071)
+library(Rtsne)
+library(RColorBrewer)
+setwd("/Users/bear/Studies/Harvard/AML/hw3")
+```
+
+
+#Exploratory Data Analysis
+
+We will start by reading in the training data and getting an idea of the data it contains
+
+```{r}
+train = read.csv("train_data.csv")
+names(train)
+```
+
+
+
+
+```{r}
+sprintf("Train dataset has: %s rows and %s columns",nrow(train),ncol(train))
+```
+
+With the large number of features and rows, certain visualisation will be a bit tricky
+
+
+```{r}
+datatypes = data.frame(types=sapply(train,class))
+ggplot(datatypes, aes(types,fill=types)) + geom_bar()
+```
+
+As we can see, most of the data is either numeric or integer. These are the x,y,z coordinate data. We are particularly interested in the auxillary features: subject, state, phase and output. We will need to decide if these are represented correctly and if not, transform them to the required datatypes before modelling
+
+```{r}
+train %>% select(c(subject, phase, state,output)) %>% summary()
+```
+
+Phase and output are both being interpreted as continuous variables. For the moment lets split the dataset between main coordinate variable, and the auxillary variables
+
+```{r}
+main.train = train[,1:666]
+main.aux = train[,667:670]
+
+sapply(main.aux,class)
+
+main.aux = main.aux %>% mutate(phase=as.factor(phase), output=as.factor(output))
+ggplot(main.aux, aes(output, fill=output)) + geom_bar() + facet_grid(~subject)
+```
+
+
+As we can see above, subject K is always 1. This could potentially cause some serious overfitting of the model as it is possible subject K has some 0 ouputs in the test set. Additionally, depending on the split of the training data, K could be an exact predictor of the output.
+
+```{r}
+test = main.aux %>% mutate(is_g = ifelse(subject == "G",1,0))
+ggplot(main.aux, aes(subject,fill=output)) + geom_bar(position = "dodge") + facet_wrap(~phase)
+```
+
+Once sclicing subject by phase, we can see that we have many cases that have only the one outcome represented. We will have to explore this further with feature engineering.
+
+
+     
+```{r}
+ggplot(main.aux, aes(subject,fill=output)) + geom_bar(position = "dodge") + facet_wrap(~state)
+```
+
+We have very few examples of state E, and we can see that there is a class imbalance for all patients once subset with the exception of Subject G. We may need to look at a way of addressing this imbalance.
+
+
+
+## First model attempt
+
+Lets take a look at a basic logistic regression model to get a feel for the issues that we may want to address for model fitting.
+
+```{r}
+log.data = cbind(main.train,dummy.data.frame(main.aux[,1:3],sep="."), output=as.numeric(main.aux$output)-1)
+
+#split into train and test
+set.seed(12346)
+bTrain = sample(1:nrow(train), size=0.8*nrow(train))
+
+train.log = log.data[bTrain,]
+test.log = log.data[-bTrain,]
+
+
+logit.mod = glm(output~. ,family=binomial,data=train.log)
+```
+
+As seen above, we will run into a problem of convergence using logistic regression on our training set if a variable perfectly predicts the outcome. Lets take a quick look at the training set to see what might be causing this
+
+```{r}
+g=gather(train.log,key =subject,value=val, subject.A, subject.B, subject.C, subject.D, subject.F, subject.G, subject.H, subject.I, subject.K, subject.L, subject.M) %>% filter(val>0) %>% mutate(subject=substr(subject,9,10),output=as.factor(output)) %>% select(c("output","subject"))
+
+ggplot(g, aes(output, fill=output)) + geom_bar() + facet_grid(~subject)
+```
+
+Looks like the problem might be subject K, however, depending on our seed we could have had more than one problematic subject.
+
+As this is just an iniatial explanatory model fitting, we will use random forest to generate a model and then take a look at variable importance.
+
+
+```{r}
+set.seed(1234)
+
+train.rf = train.log %>% mutate(output=as.factor(output))
+test.rf = test.log
+
+rfRes = randomForest(output ~. -output,data=train.rf)
+varImpPlot(rfRes)
+```
+
+Subject G is by far the best predictor here. It seem that this may be due to the class imbalance issue. We will address this in our model
+
+```{r}
+prop.table(table(train$output))
+```
+
+```{r}
+pred = predict(rfRes, newdata = test.rf %>% select(-output))
+rc = roc(test.rf$output, as.numeric(pred)-1)
+auc(rc)
+```
+
+
+This is our reference AUC score, we will be using this as the benchmark as its the metric used by kaggle.To try to improve on this based on the issues observed, we will try the following:
+
+
+1) Dimensionality reduction / visualisation
+
+2) Balance the class
+
+3) More extensive feature engineering and some form or regularization to select the best subsets of variables
+
+4) Hyperparameter optimisation of the models using k-fold cross validation
+
+
+#Dimension Reduction / Visualisation
+##Principal Component Analysis
+```{r}
+
+# For principal components, we need to remove all variables with constant variance
+pr.data = log.data[,sapply(log.data, var)!=0]
+pr.out = prcomp(pr.data, scale=TRUE)
+biplot(pr.out, cex=0.5, scale=0)
+```
+There are no obvious clusters, however we will need to color in the class labels to see if there is some discernable pattern.
+
+
+```{r}
+data.frame(pr.out$x,output=factor(log.data$output)) %>% ggplot(aes(x=PC1,y=PC2,col=output))+
+   geom_point(size=3,alpha=0.5)
+```
+
+
+```{r}
+data.frame(pr.out$x,output=factor(log.data$output)) %>% ggplot(aes(x=PC1,y=PC3,col=output))+
+   geom_point(size=3,alpha=0.5)
+```
+Again, no obvious separation in the classes here. 
+
+
+```{r}
+pr.var = pr.out$sdev ^ 2
+pve = pr.var / sum(pr.var)
+
+
+mfrow=(c(1,2))
+plot(pve , xlab=" Principal Component ", ylab=" Proportion of
+Variance Explained ", ylim=c(0,1) ,type="b")
+
+plot(cumsum (pve ), xlab=" Principal Component ", ylab ="
+Cumulative Proportion of Variance Explained ", ylim=c(0,1) ,
+type="b")
+
+```
+Unfortunately the variance is very uniform, we need around 110 principal components to get to around 91% of total variance. We see that after the first 5 or so PC, each subsequent PC provides little additional variance explanation.
+
+In addition to the training set, this experiment was repeated for the test and the total dataset. Nothing of particular interest was found.
+
+
+t-SNE does a better job with highly non-linear data, so we will try this to see if there is anything of interest.
+
+```{r}
+train.label = as.factor(train$output)
+colors = rainbow(length(unique(train.label)))
+names(colors) = unique(train.label)
+
+tsne = Rtsne(train[,-ncol(train)], dims = 2, perplexity=30, verbose=TRUE, max_iter = 500)
+
+## Plotting
+plot(tsne$Y, t='n', main="tsne")
+text(tsne$Y, labels=train.label, col=colors[train.label])
+
+```
+
+Again here we see how intertwinned our class labels are. This experiment was also repeated for the test and the combined training-test set with not much to see.
+
+
+#Re-balancing the dataset
+
+We can use the upSample function from the Caret package to create additional samples of the under-represented classes so that the distribution of the classes are identical.
+```{r}
+
+set.seed(9560)
+up_train <- upSample(x = train.rf[, -ncol(train.rf)],
+                     y = train.rf$output)     
+
+up_train = up_train %>% mutate(output=Class) %>% select(-Class)
+table(up_train$output) 
+
+```
+
+Lets try re-running randomForest on our balanced dataset
+
+```{r}
+rfRes = randomForest(output ~. -output,data=up_train)
+varImpPlot(rfRes)
+```
+We can see that this has helped, subject G is still the most important variable, however Subject K is now much more important. It has also increased the Gini decrease across the board.
+
+```{r}
+pred = predict(rfRes, newdata = test.rf %>% select(-output))
+rc = roc(test.rf$output, as.numeric(pred)-1)
+auc(rc)
+```
+We see in the AUC score -  an increase from .797 to .8175
+
+
+#Feature engineering
+
+Due to the potential overfitting we observed on the training set, we will train our final model on all the data (as Rashmi suggested). We will also use the euclidean distance that Peter suggested. Some additional exploratory features will be generated also.
+
+We will create these additional features separately, so combinations of features can be tested and dropped as needed.
+
+
+```{r}
+
+train = read.csv("train_data.csv")
+test = read.csv("test_data.csv")
+
+
+#concatenate the datasets
+all = bind_rows(train[,1:669] , test)
+
+# Create all combinations of variables
+dummies = all %>% mutate(subject=as.factor(subject), phase=as.factor(phase)) %>%
+  mutate(phsust=as.factor(paste0(phase,subject,state, sep=".")),
+                    phsu=as.factor(paste0(phase,subject, sep=".")),
+                    phst=as.factor(paste0(phase,state, sep=".")),
+                    sust=as.factor(paste0(subject,state, sep="."))) %>% 
+  select(-c(phase,subject,state)) %>% dummy.data.frame(sep=".")
+
+
+#for each x,y,z triplet, generate the euclidean between the points
+euclidean = data.frame(matrix(, nrow=nrow(all), ncol=0))
+for (i in c(1:222)){
+  euclidean[[paste0("ed",i)]] <- sqrt(all[[paste0("x",i)]] ^2 +
+                                     all[[paste0("y",i)]] ^2 +
+                                     all[[paste0("z",i)]]^2)
+}
+
+#for each x,y,z triplet, generate the manhattan distance 
+manhattan = data.frame(matrix(, nrow=nrow(all), ncol=0))
+for (i in c(1:222)){
+  manhattan[[paste0("md",i)]] <- abs(all[[paste0("x",i)]]) +
+                                 abs(all[[paste0("y",i)]]) +
+                                 abs(all[[paste0("z",i)]]) 
+}
+
+
+
+#In the event that the data is to do with a physical shape, these features may be useful
+xs = all[,grep("^x",names(all))]
+ys = all[,grep("^y",names(all))]
+zs = all[,grep("^z",names(all))]
+
+shapes = all %>% mutate(
+                    minx = min(xs),
+                    maxx = max(xs),
+                    miny = min(ys),
+                    maxy = max(ys),
+                    minz = min(zs),
+                    maxz = max(zs)) %>% 
+              mutate (
+                    len = maxx - minx,
+                    hgt = maxy - miny,
+                    wdt = maxz - minz) %>%
+              mutate (
+                    alen = abs(len),
+                    ahgt = abs(hgt),
+                    awdt = abs(wdt)) %>%
+              mutate(
+                area = alen * ahgt * awdt #,
+              #  centroid = (meanx + meany + meanz) / 3
+                    ) %>%
+              select(minx,maxx,miny,maxy,minz,maxz, len,hgt,wdt, alen,ahgt,awdt)
+
+ 
+pr.all = cbind(select(all, -c(phase,subject,state)),dummies)
+pr.all = pr.all[,sapply(pr.all,var)!=0]
+pr.out = prcomp(pr.all, scale=TRUE)
+pr.var = pr.out$sdev ^ 2
+pve = pr.var / sum(pr.var)
+pve[1:20]
+
+#PCA does a poor job of explaining the variance, but we will keep the first 5 principal components to our model in the hope that if its regarded as important, it will leverage some information from the test set hopefully yeilding to a more robust model
+
+
+```
+
+```{r}
+# Bringing it all together
+final.data = cbind(select(all, -c(phase,subject,state)), dummies, euclidean, manhattan, shapes, pr.out$x[,1:5])
+
+```
+
+
+## Dropping unnecessary features
+
+We have created a lot of features, and no doubt a lot of it wont be useful to the model. So we will try to reduce the feature size before moving on to hyperparameter optimization that will suffer under such large feature sets.
+
+```{r}
+
+#First dump variables with 0 variance
+final.data = final.data[,sapply(final.data,var)!=0]
+ 
+#split the data into train and test
+train.mod = final.data[1:nrow(train),]
+test.mod = final.data[4585:6316,]
+
+#Add our random vector
+train.mod = train.mod %>% mutate(rand = rnorm(1:nrow(train.mod)))
+
+#We will run this through random forest and use the importance of the random vector as a threshold for variables to take through to the final model
+y = as.factor(train$output) 
+rf.mod = randomForest(train.mod, y, ntree=130)
+                
+color <- brewer.pal(n = 8, "Dark2")
+imp <- as.data.frame(rf.mod$importance[order(rf.mod$importance),])
+barplot(t(imp), col=color[1])
+points(which(imp==imp['rand',]),0.6, col=color[2], type='h', lwd=2)
+```
+
+Subset data
+```{r}
+imp <- subset(imp, imp>imp['rand',])
+
+train.f <-train.mod[,rownames(imp)]
+test.f <-test.mod[,rownames(imp)]
+
+```
+We have significantly reduced the number of variables in our model from 1811 to just 54
+
+
+#Hyper parameter optimization
+
+In addition to the logistic regression and randomForest, we tried SVM with a radial kernel as the data looked highly non-linear. 
+
+The SVM, despite running a full day did not converge. So in the end, gradient boosted trees (xgboost) was chosen as our preferred algorithm for the following reasons
+
+- Shown to be robust to large number of parameter thanks the regularization it performs
+- Low variance, so hopefully it will generalise well to the unseen data
+- Blisteringly fast compared to the other techniques tried so optimising the model should be achievable in reasonable time
+
+```{r}
+
+# library(kernlab)
+# sigDist <- sigest(y ~ as.matrix(dat), data=dat, frac = 1)
+# svmTuneGrid <- data.frame(.sigma = sigDist[1], .C = 2^(-20:100))
+# grid <- expand.grid(sigma = c(.01, .015, 0.2),
+#                     C = c(0.75, 0.9, 1, 1.1, 1.25)
+# )
+# y = ifelse(y==1,"Yes","No")
+# svmFit <- train(dat,y,
+#                 method = "svmRadial",
+#                 preProc = c("center", "scale"),
+#                 tuneGrid =grid,
+#                 trControl = trainControl(method = "cv", number = 10, classProbs =  TRUE))
+# 
+# 
+# predTst <- predict(svmFit, tst, type='prob')
+# predTst <- predTst[,2]
+
+#First lets rebalance our new training set
+set.seed(9560)
+up_train.f <- upSample(x = train.f,
+                     y = y)     
+
+up_train.f = up_train.f %>% mutate(output=Class) %>% select(-Class)
+table(up_train.f$output) 
+```
+
+```{r}
+
+# set up the cross-validated hyper-parameter search
+
+
+# xgb_grid_1 = expand.grid(
+#   nrounds = 130,
+#   eta = c(1, 0.1, 0.01),
+#   max_depth = c(2,  6,  10),
+#   gamma = 1,
+#   colsample_bytree=c(.5,1),
+#   min_child_weight =c(1,10),
+#   subsample= c(.5,1)
+# )
+
+#creating a dummy grid as it takes too long to knit the document with the one orignally used
+xgb_grid_1 = expand.grid(
+  nrounds = 10,
+  eta = 0.1,
+  max_depth = 10,
+  gamma = 1,
+  colsample_bytree=.5,
+  min_child_weight =1,
+  subsample=1
+)
+
+# pack the training control parameters
+xgb_trcontrol_1 = trainControl(
+  method = "cv",
+  number = 10,
+  verboseIter = TRUE,
+  returnData = FALSE,
+  returnResamp = "all",                                                        # save losses across all models
+  classProbs = TRUE,                                                           # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+# train the model for each parameter combination in the grid, 
+#   using CV to evaluate
+xgb_train_1 = train(
+  x = as.matrix(up_train.f %>%
+                  select(-output)),
+  y = factor(up_train.f$output, labels=c("Y","N")),
+  trControl = xgb_trcontrol_1,
+  tuneGrid = xgb_grid_1,
+  method = "xgbTree"
+)
+
+cat("best model\n ")
+xgb_train_1$bestTune
+```
+
+```{r}
+# scatter plot of the AUC against max_depth and eta
+ggplot(xgb_train_1$results, aes(x = as.factor(eta), y = max_depth, size = ROC, color = ROC)) + 
+  geom_point() + 
+  theme_bw() + 
+  scale_size_continuous(guide = "none")
+```
+
+Based on the above, we can see the best parameters.We then split the training set into further train and tests set and hand tuned the parameters. 
+
+For knitting purposes, am only showing one point
+
+```{r}
+#split into train and test
+set.seed(123)
+indexes = sample(1:nrow(up_train.f), size=0.8*nrow(up_train.f))
+
+
+train.train = up_train.f[indexes,] 
+train.test = up_train.f[-indexes,]
+
+
+dtrain = xgb.DMatrix(data = as.matrix(train.train %>%
+                  select(-output)), label = as.numeric(train.train$output)-1)
+
+dtest = xgb.DMatrix(data = as.matrix(train.test %>%
+                  select(-output)), label=as.factor(train.test$output))
+
+
+watchlist = list(train=dtrain, test=dtest)
+
+bst = xgb.train(data=dtrain, nround=130, watchlist = watchlist,sub_sample = 0.9, eval.metric ="auc", eval.metric ="error", objective = "binary:logistic",eta=.01,min_child_weight=10, colsampleby_tree=.5, gamma=.1,max_depth=9)
+
+
+
+ggplot(bst$evaluation_log, aes(iter)) + 
+  geom_line(aes(y = train_error, colour = "Training Error")) + 
+  geom_line(aes(y = test_error, colour = "Test Error")) 
+
+
+
+```
+
+Slightly weird behaviour here were the test error is actually smaller than the training error. This was not happening before, but I dont have time to look into it more at the moment
+
+Was also not able to plot the train vs test AUC, despite it working earlier...strange..
+
+```{r}
+ggplot(bst$evaluation_log, aes(iter)) +
+  geom_line(aes(y = train_auc, colour = "Training AUC")) +
+  geom_line(aes(y = test_auc, colour = "Test AUC"))
+
+
+importance <- xgb.importance(feature_names = colnames(dtrain), model = bst)
+head(importance)
+
+```
+
+Our final model....
+```{r}
+dtrain = xgb.DMatrix(data = as.matrix(up_train.f %>% select(-output)), label = as.numeric(up_train.f$output)-1)
+
+dtest = xgb.DMatrix(data = as.matrix(test.f))
+
+bst = xgboost(data=dtrain, nround=125,sub_sample = 0.9, eval.metric ="error", eval.metric="auc", objective = "binary:logistic",eta=.01,min_child_weight=10, colsampleby_tree=.5, gamma=.1,max_depth=9)
+
+pred = predict(bst, dtest) 
+
+
+final = data.frame(id=1:length(pred)-1, output=pred)
+write.csv(final,file="~/tryx.csv",row.names=FALSE)
+
+```
+
+Additional things tried:
+
+- Semi-supervised approach of creating a pseudo-outcome, and then using it as a predictor on the entire dataset
+As expected, this made the internal test AUC scores fantastic as it had already classed it, however it made a slight decrease in the kaggle performance
+
+- Multiple combinations of features before settling on the method to drop them
